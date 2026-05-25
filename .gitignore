@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Test data — use gen_log_corpus.py to regenerate
+test/
+*.ufi
+*.ufc
+
+# IDE
+.vscode/
+.idea/
+*.swp
