@@ -18,6 +18,21 @@
 
 ---
 
+## 安装 — 一步到位，无需命令行
+
+| 平台 | 下载 | 安装步骤 |
+|------|------|---------|
+| **Windows** | `mucas-install-windows.zip` | 解压 → 双击 `install.bat` |
+| **macOS**   | `mucas-install-macos.zip`   | 解压 → 终端运行 `./install.sh` |
+| **Linux**   | `mucas-install-linux.zip`   | 解压 → 终端运行 `./install.sh` |
+
+安装后：**右键任意文件夹 → "Pack with μCAS"**，右键 `.mcar` 文件 → **"Unpack here"**。
+安装完成后无需再使用终端。
+
+> macOS 提示：首次使用时，请在「系统设置 → 隐私与安全性 → 扩展 → Finder」中启用快速操作。
+
+---
+
 ## Rust 实现 — v0.9.1（当前主力版本）
 
 **[`mucas-rs/`](mucas-rs/)** 是生产级 Rust crate：完整的 μCAS VM + 结构感知压缩合成器 + **多文件流式归档工具**。

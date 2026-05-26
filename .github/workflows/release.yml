@@ -80,15 +80,55 @@ jobs:
         with:
           path: dist/
 
+      - name: Generate icon (rsvg-convert + ImageMagick)
+        run: |
+          sudo apt-get install -y librsvg2-bin imagemagick
+          for size in 16 32 48 256; do
+            rsvg-convert -w $size -h $size assets/mucas.svg -o /tmp/mucas_${size}.png
+          done
+          convert /tmp/mucas_16.png /tmp/mucas_32.png /tmp/mucas_48.png /tmp/mucas_256.png assets/mucas.ico
+
+      - name: Bundle platform installers
+        run: |
+          # Windows
+          cp dist/mucas-x86_64-pc-windows-msvc/mucas-x86_64-pc-windows-msvc.exe installers/windows/mucas.exe
+          cp assets/mucas.ico installers/windows/mucas.ico
+          cd installers/windows && zip -r ../../dist/mucas-install-windows.zip . && cd ../..
+
+          # macOS (both architectures)
+          cp dist/mucas-x86_64-apple-darwin/mucas-x86_64-apple-darwin   installers/macos/mucas
+          cp dist/mucas-aarch64-apple-darwin/mucas-aarch64-apple-darwin  installers/macos/mucas-arm64
+          chmod +x installers/macos/mucas installers/macos/mucas-arm64
+          cd installers/macos && zip -r ../../dist/mucas-install-macos.zip . && cd ../..
+
+          # Linux
+          cp dist/mucas-x86_64-unknown-linux-musl/mucas-x86_64-unknown-linux-musl installers/linux/mucas
+          chmod +x installers/linux/mucas
+          cd installers/linux && zip -r ../../dist/mucas-install-linux.zip . && cd ../..
+
       - name: Create release and upload binaries
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/**/*
+          files: |
+            dist/mucas-install-windows.zip
+            dist/mucas-install-macos.zip
+            dist/mucas-install-linux.zip
+            dist/**/*
           generate_release_notes: true
           body: |
             ## μCAS ${{ github.ref_name }}
 
-            Download the binary for your platform:
+            ### Easy Install (recommended)
+
+            | Platform | Download | Steps |
+            |----------|----------|-------|
+            | **Windows** | `mucas-install-windows.zip` | Extract → double-click `install.bat` |
+            | **macOS**   | `mucas-install-macos.zip`   | Extract → run `./install.sh` in Terminal |
+            | **Linux**   | `mucas-install-linux.zip`   | Extract → run `./install.sh` in Terminal |
+
+            After installing: right-click any folder → **"Pack with μCAS"**, right-click any `.mcar` → **"Unpack here"**.
+
+            ### Raw binaries (CLI / advanced)
 
             | Platform | File |
             |----------|------|
@@ -97,18 +137,11 @@ jobs:
             | macOS Apple Silicon   | `mucas-aarch64-apple-darwin` |
             | Windows x86_64        | `mucas-x86_64-pc-windows-msvc.exe` |
 
-            ### Quick start
+            ### Quick start (CLI)
 
             ```sh
-            # Pack a directory
-            mucas pack my_folder/ -o archive.mcar
-
-            # Unpack
-            mucas unpack archive.mcar -o restored/
-
-            # List contents
-            mucas list archive.mcar
-
-            # Verify integrity
-            mucas check archive.mcar
+            mucas pack    my_folder/    -o archive.mcar
+            mucas unpack  archive.mcar  -o restored/
+            mucas list    archive.mcar
+            mucas check   archive.mcar
             ```

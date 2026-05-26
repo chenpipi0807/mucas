@@ -11,6 +11,21 @@ A deterministic bytecode language for structured compression, paired with an inf
 
 ---
 
+## Install — one step, no terminal required
+
+| Platform | Download | Steps |
+|----------|----------|-------|
+| **Windows** | `mucas-install-windows.zip` | Extract → double-click `install.bat` |
+| **macOS**   | `mucas-install-macos.zip`   | Extract → run `./install.sh` in Terminal |
+| **Linux**   | `mucas-install-linux.zip`   | Extract → run `./install.sh` in Terminal |
+
+After installing: **right-click any folder → "Pack with μCAS"**, right-click any `.mcar` → **"Unpack here"**.
+No terminal needed after installation.
+
+> macOS note: on first use, enable the Quick Actions in System Settings → Privacy & Security → Extensions → Finder.
+
+---
+
 ## Rust implementation — v0.9.1 (active)
 
 **[`mucas-rs/`](mucas-rs/)** is the production Rust crate: a complete, self-contained

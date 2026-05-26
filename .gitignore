@@ -30,6 +30,13 @@ bench_ref.py
 bench_wrapped.py
 mucas_smart.py
 
+# Installer staging files (CI copies these during build — don't commit)
+installers/windows/mucas.exe
+installers/windows/mucas.ico
+installers/macos/mucas
+installers/macos/mucas-arm64
+installers/linux/mucas
+
 # Claude internal
 .claude/
 
