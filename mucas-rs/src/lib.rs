@@ -19,6 +19,7 @@ pub mod synth;
 pub mod sched;
 pub mod format;
 pub mod pipeline;
+pub mod archive;
 
 use std::collections::HashMap;
 

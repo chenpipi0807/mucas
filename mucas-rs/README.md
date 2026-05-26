@@ -54,30 +54,78 @@ The VM has 10 opcodes: `LIT CPY LOOP CALL MAP REF ELIT SCAN NEXT HALT`.
 SCAN is the key structural instruction — it executes a template subroutine N times,
 pulling variable fields from a compact parameter stream per iteration.
 
-## Installation
+## Quick start — pre-built binary
+
+Download the latest release from the
+[Releases page](https://github.com/chenpipi0807/mucas/releases):
+
+| Platform | File |
+|----------|------|
+| Linux x86_64 (static) | `mucas-x86_64-unknown-linux-musl` |
+| macOS Intel | `mucas-x86_64-apple-darwin` |
+| macOS Apple Silicon | `mucas-aarch64-apple-darwin` |
+| Windows x86_64 | `mucas-x86_64-pc-windows-msvc.exe` |
+
+```sh
+# macOS / Linux — make executable once
+chmod +x mucas-*
+
+# Pack a directory
+./mucas pack  my_folder/  -o archive.mcar
+
+# Unpack
+./mucas unpack  archive.mcar  -o restored/
+
+# List contents (no extraction)
+./mucas list  archive.mcar
+
+# Verify integrity
+./mucas check  archive.mcar
+```
+
+## Build from source
 
 ```sh
 git clone https://github.com/chenpipi0807/mucas
 cd mucas/mucas-rs
-cd mucas-rs
 cargo build --release
 # binary: target/release/mucas
 ```
 
-Requires Rust 1.70+.  No system dependencies beyond the standard library and
-[flate2](https://crates.io/crates/flate2) (zlib bindings).
+Requires Rust 1.70+.  No system dependencies beyond the standard library,
+[flate2](https://crates.io/crates/flate2) (zlib bindings), and
+[indicatif](https://crates.io/crates/indicatif) (progress bars).
 
 ## CLI usage
 
 ```sh
-# Compress a file
-mucas compress  input.csv       output.mucas
+# --- Archive commands ---
+
+# Pack a directory into a .mcar archive
+mucas pack    my_folder/         -o archive.mcar
+
+# Pack with a custom memory limit (default: 256 MiB)
+mucas pack    my_folder/  --max-memory 512  -o archive.mcar
+
+# Unpack to a directory
+mucas unpack  archive.mcar       -o restored/
+
+# List archive contents (path, method, sizes)
+mucas list    archive.mcar
+
+# Verify archive integrity without extracting
+mucas check   archive.mcar
+
+# --- Single-file commands ---
+
+# Compress a single file
+mucas compress   input.csv       output.mucas
 
 # Decompress
-mucas decompress output.mucas   restored.csv
+mucas decompress output.mucas    restored.csv
 
 # Benchmark (shows data class, compression path, ratio vs zlib)
-mucas bench     input.csv
+mucas bench      input.csv
 ```
 
 ### Example benchmark output
@@ -143,6 +191,10 @@ assert_eq!(vm.output, data);
 | `SemiStructured` | default (JSON/XML/config) | full synthesis |
 | `UnstructuredText` | high literal fraction + short matches | MAP only |
 | `Binary` | entropy > 7.5 bits/byte + non-UTF-8 | LZ only |
+| `AlreadyCompressed` | magic bytes: JPEG, PNG, MP4, ZIP, 7z, RAR, gzip, … | Store |
+
+The `AlreadyCompressed` check runs before entropy analysis, so image and media
+files are never wasted CPU cycles attempting re-compression.
 
 ## Architecture notes
 
@@ -165,6 +217,8 @@ assert_eq!(vm.output, data);
 | v0.5 | Suffix-array macro extractor (patterns 65–1024 B) |
 | v0.6 | Multi-delimiter SCAN (CSV / TSV / pipe) |
 | v0.7 | Quoted CSV (RFC-4180); NDJSON SCAN; `DataClass::JsonArray` |
+| v0.8 | `AlreadyCompressed` detection; MCAR multi-file archive format; rayon parallel compression |
+| v0.9 | Streaming `ArchiveWriter`/`ArchiveReader` (constant memory); MDL-based method selection; `pack`/`unpack`/`list`/`check` CLI; `indicatif` progress bars; GitHub Actions CI/CD |
 
 ## License
 

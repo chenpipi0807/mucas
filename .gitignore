@@ -16,6 +16,23 @@ test/
 *.ufi
 *.ufc
 
+# Benchmark datasets and output archives (may contain confidential files)
+bench_sample/
+bench_10g/
+bench_extract_out/
+bench_out_*
+*.mcar
+*.7z
+
+# Internal scratch scripts
+bench_real.py
+bench_ref.py
+bench_wrapped.py
+mucas_smart.py
+
+# Claude internal
+.claude/
+
 # IDE
 .vscode/
 .idea/

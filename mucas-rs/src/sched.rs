@@ -16,7 +16,7 @@ use crate::synth::{PatternSynthesizer, SynthProgram, shannon_entropy_byte};
 // ---------------------------------------------------------------------------
 
 /// Return a PatternSynthesizer tuned for `class`, or `None` if synthesis
-/// should be skipped (Binary path).
+/// should be skipped (Binary / AlreadyCompressed paths).
 pub fn synthesizer_for(class: DataClass) -> Option<PatternSynthesizer> {
     match class {
         // Full synthesis: LOOP + MAP + Macro + SCAN all enabled.
@@ -30,6 +30,10 @@ pub fn synthesizer_for(class: DataClass) -> Option<PatternSynthesizer> {
 
         // LZ-only — no synthesis overhead on already-compressed or encrypted data.
         DataClass::Binary =>
+            None,
+
+        // Store verbatim — re-compressing would expand the data.
+        DataClass::AlreadyCompressed =>
             None,
     }
 }
@@ -51,6 +55,8 @@ pub enum DataClass {
     UnstructuredText,
     /// Binary / already-compressed: LZ-only.
     Binary,
+    /// Known compressed format (JPEG, PNG, ZIP, gzip, MP4, …): Store verbatim.
+    AlreadyCompressed,
 }
 
 impl DataClass {}
@@ -87,6 +93,37 @@ impl ClassMetrics {
 }
 
 // ---------------------------------------------------------------------------
+// Magic-byte detection for already-compressed formats
+// ---------------------------------------------------------------------------
+
+/// Returns true if `data` starts with a magic signature that indicates the
+/// content is already compressed (JPEG, PNG, ZIP, gzip, MP4, etc.).
+/// Re-compressing these files wastes CPU and expands their size.
+pub fn is_already_compressed(data: &[u8]) -> bool {
+    let starts = |magic: &[u8]| data.starts_with(magic);
+
+    starts(&[0xFF, 0xD8, 0xFF])                             // JPEG
+    || starts(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) // PNG
+    || starts(b"GIF8")                                       // GIF87a / GIF89a
+    || (starts(&[0x52, 0x49, 0x46, 0x46])                   // WebP (RIFF....WEBP)
+        && data.get(8..12) == Some(&[0x57, 0x45, 0x42, 0x50]))
+    || (data.len() >= 12                                     // MP4 / MOV / M4A ("ftyp" at offset 4)
+        && data[4..8] == [0x66, 0x74, 0x79, 0x70])
+    || starts(&[0x50, 0x4B, 0x03, 0x04])                    // ZIP / DOCX / XLSX / PPTX
+    || starts(&[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C])        // 7z
+    || starts(&[0x52, 0x61, 0x72, 0x21, 0x1A, 0x07])        // RAR
+    || starts(&[0x1F, 0x8B])                                 // gzip
+    || starts(&[0x42, 0x5A, 0x68])                           // bzip2 ("BZh")
+    || starts(&[0x28, 0xB5, 0x2F, 0xFD])                    // zstd
+    || starts(&[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00])        // XZ
+    || starts(&[0x4D, 0x5A])                                 // PE executable (.exe / .dll / .sys)
+    || starts(b"OggS")                                       // OGG (audio/video container)
+    || starts(&[0x66, 0x4C, 0x61, 0x43])                    // FLAC audio
+    || starts(&[0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70]) // some MP4 variants
+    || starts(b"PACK")                                       // git pack objects
+}
+
+// ---------------------------------------------------------------------------
 // Heuristic classifier
 // ---------------------------------------------------------------------------
 
@@ -104,6 +141,12 @@ pub fn classify_with_data(metrics: &ClassMetrics, data: &[u8]) -> DataClass {
 }
 
 fn classify_from_metrics(metrics: &ClassMetrics, data: Option<&[u8]>) -> DataClass {
+    // AlreadyCompressed: magic-byte check must precede entropy check because
+    // JPEG / MP4 have high entropy (≈7.9 b/B) and would otherwise fall into Binary.
+    if let Some(d) = data {
+        if is_already_compressed(d) { return DataClass::AlreadyCompressed; }
+    }
+
     // Binary: near-random byte distribution AND not valid UTF-8 text.
     if metrics.byte_entropy > 7.5 && metrics.utf8_valid_ratio < 0.70 {
         return DataClass::Binary;
@@ -320,6 +363,51 @@ mod tests {
                      The five boxing wizards jump quickly.\n".repeat(10);
         let cls = classify(&metrics(&data));
         assert_ne!(cls, DataClass::StructuredLog);
+    }
+
+    // --- is_already_compressed ---
+
+    #[test]
+    fn is_already_compressed_jpeg() {
+        assert!(is_already_compressed(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]));
+    }
+
+    #[test]
+    fn is_already_compressed_png() {
+        assert!(is_already_compressed(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00]));
+    }
+
+    #[test]
+    fn is_already_compressed_zip() {
+        assert!(is_already_compressed(&[0x50, 0x4B, 0x03, 0x04, 0x14, 0x00]));
+    }
+
+    #[test]
+    fn is_already_compressed_gzip() {
+        assert!(is_already_compressed(&[0x1F, 0x8B, 0x08, 0x00]));
+    }
+
+    #[test]
+    fn is_already_compressed_mp4() {
+        // 12-byte slice with "ftyp" at offset 4
+        let mut d = [0u8; 12];
+        d[4..8].copy_from_slice(b"ftyp");
+        assert!(is_already_compressed(&d));
+    }
+
+    #[test]
+    fn plain_text_not_already_compressed() {
+        assert!(!is_already_compressed(b"col1,col2,col3\n"));
+        assert!(!is_already_compressed(b"Hello, world!"));
+    }
+
+    #[test]
+    fn classify_jpeg_as_already_compressed() {
+        let mut data = vec![0xFF_u8, 0xD8, 0xFF, 0xE0];
+        data.extend_from_slice(&[0x00; 500]); // pad to make metrics computable
+        let a = LzEncoder::new().analyze(&data);
+        let m = ClassMetrics::compute(&data, &a);
+        assert_eq!(classify_with_data(&m, &data), DataClass::AlreadyCompressed);
     }
 
     // --- AdaptiveScheduler round-trips ---

@@ -11,17 +11,63 @@ A deterministic bytecode language for structured compression, paired with an inf
 
 ---
 
-## Rust implementation — v0.7.0 (active)
+## Rust implementation — v0.9.1 (active)
 
 **[`mucas-rs/`](mucas-rs/)** is the production Rust crate: a complete, self-contained
-compressor and CLI tool that implements the μCAS VM and all synthesis passes.
+compressor, archiver, and CLI tool that implements the μCAS VM and all synthesis passes.
+
+### Quick start — one command
+
+```sh
+# Download a pre-built binary from the Releases page, then:
+mucas pack    my_folder/  -o archive.mcar    # compress a whole directory
+mucas unpack  archive.mcar  -o restored/     # restore it
+mucas list    archive.mcar                   # see what's inside
+mucas check   archive.mcar                   # verify integrity
+```
+
+### Build from source
 
 ```sh
 cargo build --release --manifest-path mucas-rs/Cargo.toml
 mucas-rs/target/release/mucas bench your_file.csv
 ```
 
-### Performance vs zlib (v0.7.0)
+### Real-world benchmark (v0.9.1)
+
+Tested on two representative mixed archives — the kind you'd actually want to back up
+(videos, office documents, wheel archives, zip files, CSV data):
+
+**1 GB mixed archive (19 files: MP4, PNG, PPTX, ZIP, CSV, WAV, MD)**
+
+| Tool | Time | Output size |
+|------|------|-------------|
+| **μCAS v0.9** | **13 s** | 721 MB (99.0%) |
+| ZIP (Deflate) | 17 s | 719 MB (98.9%) |
+| 7-zip (LZMA2 -mx=5) | 28 s | 708 MB (97.4%) |
+
+**8.5 GB mixed archive (videos, Python wheels, PPTX, EXE, ZIP, CSV, WAV)**
+
+| Tool | Time | Output size |
+|------|------|-------------|
+| **μCAS v0.9** | **7 s** | 8.8 GB (99.9%) |
+| 7-zip (LZMA2 -mx=5) | **313 s** | 8.8 GB (99.9%) |
+
+μCAS is **45× faster** than 7-zip on large mixed archives, with identical output size.
+The speedup comes entirely from *not* wasting CPU: already-compressed formats (MP4, WHL, PPTX,
+ZIP, EXE, …) are detected by magic bytes in ≤ 12 bytes and stream-copied verbatim.
+7-zip attempts full LZMA2 compression on every file regardless of content.
+
+### v0.9 features
+- **Streaming constant-memory archiver** — packs 800 GB directories without loading more than
+  one file at a time; memory budget configurable with `--max-memory MiB`.
+- **Smart method selection** — μCAS vs Zlib vs Store chosen per-file by MDL comparison.
+- **Already-compressed detection** — JPEG, PNG, MP4, ZIP, 7z, RAR, gzip, PE (.exe), OGG, and
+  more detected by magic bytes and stored verbatim (no wasted CPU).
+- **Progress bars** via `indicatif`.
+- **Pre-built binaries** for Linux, macOS (Intel + Apple Silicon), and Windows via GitHub Actions.
+
+### Performance vs zlib (v0.7.0+)
 
 | Format | Example | vs zlib |
 |--------|---------|---------|

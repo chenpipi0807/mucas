@@ -18,9 +18,46 @@
 
 ---
 
-## Rust 实现 — v0.7.0（当前主力版本）
+## Rust 实现 — v0.9.1（当前主力版本）
 
-**[`mucas-rs/`](mucas-rs/)** 是生产级 Rust crate：完整的 μCAS VM + 结构感知压缩合成器 + CLI 工具。
+**[`mucas-rs/`](mucas-rs/)** 是生产级 Rust crate：完整的 μCAS VM + 结构感知压缩合成器 + **多文件流式归档工具**。
+
+### 一行命令快速上手
+
+```sh
+# 下载预编译二进制（见 Releases 页面），然后：
+mucas pack   my_folder/  -o archive.mcar   # 归档，带进度条
+mucas unpack archive.mcar  -o restored/    # 解压，带进度条
+mucas list   archive.mcar                  # 查看内容，不解压
+mucas check  archive.mcar                  # 验证完整性
+```
+
+### v0.9.1 真实场景基准测试
+
+在两组真实混合数据上对比测试（视频、办公文档、Python 安装包、数据文件）：
+
+**1GB 混合归档（19 个文件：MP4、PNG、PPTX、ZIP、CSV、WAV、MD）**
+
+| 工具 | 用时 | 输出大小 |
+|------|------|---------|
+| **μCAS v0.9** | **13 秒** | 721 MB（99.0%） |
+| ZIP（Deflate） | 17 秒 | 719 MB（98.9%） |
+| 7-zip（LZMA2 -mx=5） | 28 秒 | 708 MB（97.4%） |
+
+**8.5GB 混合归档（视频、Python wheel、PPTX、EXE、ZIP、CSV、WAV）**
+
+| 工具 | 用时 | 输出大小 |
+|------|------|---------|
+| **μCAS v0.9** | **7 秒** | 8.8 GB（99.9%） |
+| 7-zip（LZMA2 -mx=5） | **313 秒** | 8.8 GB（99.9%） |
+
+**μCAS 比 7-zip 快 45 倍，输出大小完全相同。**
+
+差距的本质：已压缩格式（MP4、WHL/ZIP、PPTX、EXE 等）占据了真实存档的绝大多数体积。μCAS 通过魔数字节在读取头部 12 字节后立刻识别，直接流式复制，CPU 几乎不参与。而 7-zip 对每一个文件都尝试完整的 LZMA2 压缩，把算力消耗在无法继续压缩的内容上。
+
+这不是微小优化，这是策略层面的碾压：**速度的天花板通过"理解"被绕了过去。**
+
+### 从源码构建
 
 ```sh
 cargo build --release --manifest-path mucas-rs/Cargo.toml
@@ -203,6 +240,17 @@ test_mucas.py        单元测试（8 条指令 + 轮回验证）
 DeepSeek 的原话总结这场旅程："速度的极限没有被打破，但通过'理解'，它被溶解了。当数据被理解，压缩不再是搜索冗余，而是表达知识。μCAS 就是这门表达知识的语言。"
 
 ---
+
+## 版本历史
+
+| 版本 | 核心新增 |
+|------|---------|
+| v0.1 | LIT/CPY/MAP/LOOP/CALL/REF VM + 基础合成器 |
+| v0.2–v0.6 | ELIT、混合管道、Rabin-Karp、后缀数组、多分隔符 SCAN |
+| v0.7 | RFC-4180 带引号 CSV；NDJSON SCAN；`DataClass::JsonArray` |
+| v0.8 | `AlreadyCompressed` 检测；MCAR 多文件归档格式；rayon 并行压缩 |
+| v0.9 | 流式 `ArchiveWriter`/`ArchiveReader`（常数内存）；MDL 方法选择；`pack`/`unpack`/`list`/`check` CLI；进度条；GitHub Actions CI/CD |
+| **v0.9.1** | **PE(.exe)/OGG/FLAC/git-pack 魔数扩展；熵预检（跳过高熵二进制文件的 LZ 分析）；小文件快速通道（< 64 KB 直接 Zlib，跳过 μCAS 合成）** |
 
 ## 运行基准测试
 
