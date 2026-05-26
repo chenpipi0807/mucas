@@ -8,6 +8,43 @@ A deterministic bytecode language for structured compression, paired with an inf
 
 ---
 
+## Rust implementation — v0.7.0 (active)
+
+**[`mucas-rs/`](mucas-rs/)** is the production Rust crate: a complete, self-contained
+compressor and CLI tool that implements the μCAS VM and all synthesis passes.
+
+```sh
+cargo build --release --manifest-path mucas-rs/Cargo.toml
+mucas-rs/target/release/mucas bench your_file.csv
+```
+
+### Performance vs zlib (v0.7.0)
+
+| Format | Example | vs zlib |
+|--------|---------|---------|
+| Pipe-delimited log | nginx access log | **−86%** |
+| Identical log lines | batch output | **−47%** |
+| Space-separated syslog | varied timestamps | **−76%** |
+| Quoted CSV (RFC-4180) | address books | **−66%** |
+| NDJSON | API responses | **−30%** |
+| TSV | spreadsheet exports | **−17%** |
+| CSV (plain) | database exports | **−12%** |
+
+All results are round-trip verified. Methodology and per-file breakdowns:
+**[mucas-rs/BENCHMARK.md](mucas-rs/BENCHMARK.md)**
+
+### What v0.7 synthesizes
+
+| Pattern | Instruction | Notes |
+|---------|-------------|-------|
+| CSV / TSV / pipe rows with fixed columns | `SCAN` | RFC-4180 quoted fields supported |
+| NDJSON / JSON arrays | `SCAN` | preserves exact whitespace |
+| Exact periodic repetition | `LOOP` | |
+| Repeated byte sequences | `CALL` (macro) | Rabin-Karp up to 64 B; suffix-array up to 1024 B |
+| Arithmetic / delta sequences | `MAP` | timestamps, counters |
+
+---
+
 ## What is μCAS?
 
 μCAS is **not** a replacement for 7-zip or zstd. It is a format standard for expressing *how to reconstruct data* using a minimal instruction set, designed so that:

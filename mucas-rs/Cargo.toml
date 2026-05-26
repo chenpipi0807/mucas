@@ -1,0 +1,20 @@
+[package]
+name = "mucas-rs"
+version = "0.7.0"
+edition = "2021"
+description = "μCAS — structure-aware adaptive compressor for structured text data"
+keywords  = ["compression", "csv", "json", "ndjson", "structured-data"]
+categories = ["compression", "encoding"]
+license = "MIT"
+readme = "README.md"
+
+[lib]
+name = "mucas"
+path = "src/lib.rs"
+
+[dependencies]
+flate2 = "1.0"
+
+[[bin]]
+name = "mucas"
+path = "src/main.rs"
