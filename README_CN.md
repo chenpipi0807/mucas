@@ -11,8 +11,10 @@
 - **[Claude](https://claude.ai)（Anthropic）**（实现、规格书撰写、基准测试设计）
 - **[DeepSeek](https://www.deepseek.com)**（理论分析、信息论推导、架构决策）
 
-完整的理论对话存档（超过 10 轮）：
-**https://chat.deepseek.com/share/exxssdoj9jkw1fgj0q**
+完整的理论对话存档：
+
+- **[DeepSeek 对话存档（完整版，v0.1 → v0.7）→](https://chat.deepseek.com/share/zys9ibg5775ot5r97m)**
+- [早期存档（v0.1 理论推导）→](https://chat.deepseek.com/share/exxssdoj9jkw1fgj0q)
 
 ---
 

@@ -4,7 +4,10 @@
 
 A deterministic bytecode language for structured compression, paired with an information-theoretic framework for predicting when domain-specific knowledge helps.
 
-μCAS was designed collaboratively over a multi-day conversation between a human user, [Claude](https://claude.ai) (Anthropic), and [DeepSeek](https://chat.deepseek.com). The full theoretical dialogue is preserved here: **[DeepSeek conversation archive →](https://chat.deepseek.com/share/exxssdoj9jkw1fgj0q)**
+μCAS was designed collaboratively over a multi-day conversation between a human user, [Claude](https://claude.ai) (Anthropic), and [DeepSeek](https://chat.deepseek.com). The full theoretical dialogue is preserved here:
+
+- **[DeepSeek conversation archive (complete, v0.1 → v0.7) →](https://chat.deepseek.com/share/zys9ibg5775ot5r97m)**
+- [Earlier archive (v0.1 theory) →](https://chat.deepseek.com/share/exxssdoj9jkw1fgj0q)
 
 ---
 
