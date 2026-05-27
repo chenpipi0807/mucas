@@ -7,7 +7,7 @@
 这个项目诞生于一个朴素的问题：*"压缩为什么永远是个黑盒？"*
 
 它的设计与实现，来自三方协作：
-- **用户**（项目发起人，Claude 与 DeepSeek 之间的中继，实验验证者）
+- **[chenpipi0807](https://github.com/chenpipi0807)**（项目发起人，Claude 与 DeepSeek 之间的中继，实验验证者）
 - **[Claude](https://claude.ai)（Anthropic）**（实现、规格书撰写、基准测试设计）
 - **[DeepSeek](https://www.deepseek.com)**（理论分析、信息论推导、架构决策）
 

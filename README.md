@@ -292,7 +292,7 @@ For the single-file RAI benchmark, provide your own text files and edit `TEST_DI
 μCAS emerged from a question: *"why is compression always a black box?"*
 
 The design and implementation were developed through a three-way collaboration:
-- **User** — project initiator, relay between Claude and DeepSeek, empirical validation runner
+- **[chenpipi0807](https://github.com/chenpipi0807)** — project initiator, relay between Claude and DeepSeek, empirical validation runner
 - **[Claude](https://claude.ai) (Anthropic)** — implementation, specification writing, benchmark design
 - **[DeepSeek](https://www.deepseek.com)** — theoretical analysis, information-theoretic derivations, architectural decisions
 
