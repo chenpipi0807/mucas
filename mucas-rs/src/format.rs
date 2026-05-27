@@ -1,4 +1,4 @@
-//! .mucas file format — v0.1
+//! .mucas file format — v0.1 (extended in v0.11 with optional consensus section)
 //!
 //! Binary layout (all multi-byte integers are little-endian):
 //!
@@ -6,45 +6,60 @@
 //!   ------  ----  -----
 //!   0       4     Magic: "MCAS" = [0x4D, 0x43, 0x41, 0x53]
 //!   4       1     Version: 0x01
-//!   5       1     Flags (v0.1: reserved, must be 0x00)
+//!   5       1     Flags: 0x00 = baseline; 0x01 = FLAG_HAS_CONSENSUS
 //!   6       4     payload_len: u32 — decompressed payload byte count
 //!   10      …     zlib-compressed payload (see below)
 //!
-//! Decompressed payload layout:
-//!
+//! Decompressed payload when flags == 0x00 (baseline):
 //!   sub_count: u32
 //!   for each sub (sorted by ascending ID):
-//!     id:       u32
-//!     body_len: u32
-//!     body:     [u8; body_len]
-//!   main program bytes (all remaining bytes)
+//!     id: u32, body_len: u32, body[body_len]
+//!   main program bytes (all remaining)
 //!
-//! A payload with sub_count=0 is valid and common (LOOP/MAP programs need no subs).
+//! Decompressed payload when flags & 0x01 == 0x01 (HAS_CONSENSUS):
+//!   consensus_count: u32
+//!   for each pattern:
+//!     hash_len: u8, hash[hash_len], pat_len: u32, pat[pat_len]
+//!   sub_count: u32
+//!   for each sub (sorted by ascending ID):
+//!     id: u32, body_len: u32, body[body_len]
+//!   main program bytes (all remaining)
 
-use crate::Subs;
+use crate::{Consensus, Subs};
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use std::io::{Read, Write};
 
-pub const MAGIC:   [u8; 4] = [0x4D, 0x43, 0x41, 0x53]; // "MCAS"
-pub const VERSION: u8 = 0x01;
+pub const MAGIC:             [u8; 4] = [0x4D, 0x43, 0x41, 0x53]; // "MCAS"
+pub const VERSION:           u8      = 0x01;
+const FLAG_HAS_CONSENSUS:    u8      = 0x01;
 
 // ---------------------------------------------------------------------------
 // MucasFile
 // ---------------------------------------------------------------------------
 
-/// A .mucas archive: μCAS program + subroutine table, wrapped in MCAS format.
+/// A .mucas archive: μCAS program + subroutine table + optional consensus dictionary.
 #[derive(Debug)]
 pub struct MucasFile {
-    pub program: Vec<u8>,
-    pub subs:    Subs,
-    pub flags:   u8,
+    pub program:   Vec<u8>,
+    pub subs:      Subs,
+    pub flags:     u8,
+    /// REF hash → pattern bytes (non-empty only when FLAG_HAS_CONSENSUS is set).
+    pub consensus: Consensus,
 }
 
 impl MucasFile {
+    /// Construct with no consensus (backward-compatible, flags=0x00).
     pub fn new(program: Vec<u8>, subs: Subs) -> Self {
-        MucasFile { program, subs, flags: 0x00 }
+        MucasFile { program, subs, flags: 0x00, consensus: Consensus::new() }
+    }
+
+    /// Construct with an embedded consensus dictionary.
+    /// If `consensus` is empty, behaves identically to `new()`.
+    pub fn new_with_consensus(program: Vec<u8>, subs: Subs, consensus: Consensus) -> Self {
+        let flags = if consensus.is_empty() { 0x00 } else { FLAG_HAS_CONSENSUS };
+        MucasFile { program, subs, flags, consensus }
     }
 
     /// Serialize to .mucas bytes (header + zlib-compressed payload).
@@ -65,7 +80,7 @@ impl MucasFile {
     /// Parse from .mucas bytes.
     pub fn decode(data: &[u8]) -> Result<Self, FormatError> {
         if data.len() < 10 { return Err(FormatError::TooShort); }
-        if data[0..4] != MAGIC  { return Err(FormatError::BadMagic); }
+        if data[0..4] != MAGIC   { return Err(FormatError::BadMagic); }
         if data[4]    != VERSION { return Err(FormatError::UnsupportedVersion(data[4])); }
 
         let flags       = data[5];
@@ -80,9 +95,19 @@ impl MucasFile {
             });
         }
 
-        let (subs, prog_start) = parse_subs(&payload)?;
+        let mut pos = 0usize;
+
+        let consensus = if flags & FLAG_HAS_CONSENSUS != 0 {
+            let (c, new_pos) = parse_consensus(&payload, pos)?;
+            pos = new_pos;
+            c
+        } else {
+            Consensus::new()
+        };
+
+        let (subs, prog_start) = parse_subs_at(&payload, pos)?;
         let program = payload[prog_start..].to_vec();
-        Ok(MucasFile { program, subs, flags })
+        Ok(MucasFile { program, subs, flags, consensus })
     }
 
     /// Encoded file size / raw program size (lower = better compression).
@@ -95,13 +120,24 @@ impl MucasFile {
 
     fn build_payload(&self) -> Vec<u8> {
         let mut p = Vec::new();
-        p.extend_from_slice(&(self.subs.len() as u32).to_le_bytes());
 
-        let mut sorted: Vec<(u32, &Vec<u8>)> =
+        if !self.consensus.is_empty() {
+            let mut sorted_c: Vec<(&Vec<u8>, &Vec<u8>)> = self.consensus.iter().collect();
+            sorted_c.sort_by_key(|(h, _)| *h);
+            p.extend_from_slice(&(sorted_c.len() as u32).to_le_bytes());
+            for (hash, pattern) in &sorted_c {
+                p.push(hash.len() as u8);
+                p.extend_from_slice(hash);
+                p.extend_from_slice(&(pattern.len() as u32).to_le_bytes());
+                p.extend_from_slice(pattern);
+            }
+        }
+
+        let mut sorted_s: Vec<(u32, &Vec<u8>)> =
             self.subs.iter().map(|(&id, b)| (id, b)).collect();
-        sorted.sort_by_key(|(id, _)| *id);
-
-        for (id, body) in sorted {
+        sorted_s.sort_by_key(|(id, _)| *id);
+        p.extend_from_slice(&(sorted_s.len() as u32).to_le_bytes());
+        for (id, body) in sorted_s {
             p.extend_from_slice(&id.to_le_bytes());
             p.extend_from_slice(&(body.len() as u32).to_le_bytes());
             p.extend_from_slice(body);
@@ -111,11 +147,41 @@ impl MucasFile {
     }
 }
 
-fn parse_subs(payload: &[u8]) -> Result<(Subs, usize), FormatError> {
-    if payload.len() < 4 { return Err(FormatError::TooShort); }
-    let sub_count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
-    let mut pos   = 4;
-    let mut subs  = Subs::new();
+// ---------------------------------------------------------------------------
+// Payload parsers
+// ---------------------------------------------------------------------------
+
+fn parse_consensus(payload: &[u8], mut pos: usize) -> Result<(Consensus, usize), FormatError> {
+    if pos + 4 > payload.len() { return Err(FormatError::TooShort); }
+    let count = u32::from_le_bytes(payload[pos..pos+4].try_into().unwrap()) as usize;
+    pos += 4;
+
+    let mut consensus = Consensus::new();
+    for _ in 0..count {
+        if pos >= payload.len() { return Err(FormatError::TooShort); }
+        let hash_len = payload[pos] as usize;
+        pos += 1;
+        if pos + hash_len > payload.len() { return Err(FormatError::TooShort); }
+        let hash = payload[pos..pos + hash_len].to_vec();
+        pos += hash_len;
+
+        if pos + 4 > payload.len() { return Err(FormatError::TooShort); }
+        let pat_len = u32::from_le_bytes(payload[pos..pos+4].try_into().unwrap()) as usize;
+        pos += 4;
+        if pos + pat_len > payload.len() { return Err(FormatError::TooShort); }
+        let pattern = payload[pos..pos + pat_len].to_vec();
+        pos += pat_len;
+
+        consensus.insert(hash, pattern);
+    }
+    Ok((consensus, pos))
+}
+
+fn parse_subs_at(payload: &[u8], mut pos: usize) -> Result<(Subs, usize), FormatError> {
+    if pos + 4 > payload.len() { return Err(FormatError::TooShort); }
+    let sub_count = u32::from_le_bytes(payload[pos..pos+4].try_into().unwrap()) as usize;
+    pos += 4;
+    let mut subs = Subs::new();
 
     for _ in 0..sub_count {
         if pos + 8 > payload.len() { return Err(FormatError::TooShort); }
@@ -123,7 +189,7 @@ fn parse_subs(payload: &[u8]) -> Result<(Subs, usize), FormatError> {
         let body_len = u32::from_le_bytes(payload[pos+4..pos+8].try_into().unwrap()) as usize;
         pos += 8;
         if pos + body_len > payload.len() { return Err(FormatError::TooShort); }
-        subs.insert(id, payload[pos..pos+body_len].to_vec());
+        subs.insert(id, payload[pos..pos + body_len].to_vec());
         pos += body_len;
     }
     Ok((subs, pos))
@@ -196,7 +262,7 @@ mod tests {
         let b = f.encode();
         assert_eq!(&b[0..4], b"MCAS");
         assert_eq!(b[4], 0x01); // version
-        assert_eq!(b[5], 0x00); // flags
+        assert_eq!(b[5], 0x00); // flags — no consensus
     }
 
     #[test]
@@ -205,15 +271,13 @@ mod tests {
         let decoded = MucasFile::decode(&encoded).unwrap();
         assert!(decoded.program.is_empty());
         assert!(decoded.subs.is_empty());
+        assert!(decoded.consensus.is_empty());
     }
 
     #[test]
     fn round_trip_program_with_subs() {
-        // sub 0 = LIT("PREFIX:")
         let sub_body: Vec<u8> = ProgramBuilder::new().lit(b"PREFIX:").build().0;
         let subs: Subs = [(0u32, sub_body)].into_iter().collect();
-
-        // main = CALL(0) LIT("suffix")
         let main: Vec<u8> = ProgramBuilder::new().call(0).lit(b"suffix").build().0;
 
         let encoded = MucasFile::new(main.clone(), subs.clone()).encode();
@@ -250,6 +314,40 @@ mod tests {
         assert!(ratio < 0.05, "expected < 5% of original, got {ratio:.2}");
     }
 
+    // --- Consensus embedding ---
+
+    #[test]
+    fn consensus_round_trip_via_mucasfile() {
+        let pattern = b"SERVER_LOG_ENTRY_PREFIX_DATA:".to_vec();
+        let mut consensus = Consensus::new();
+        consensus.insert(vec![0x00], pattern.clone());
+
+        // Program: single REF token
+        let prog = vec![0x05u8, 0x01, 0x00]; // REF hash_len=1 hash=[0x00]
+
+        let encoded = MucasFile::new_with_consensus(prog.clone(), no_subs(), consensus.clone()).encode();
+
+        // flags byte must be FLAG_HAS_CONSENSUS
+        assert_eq!(encoded[5], 0x01, "flags should have FLAG_HAS_CONSENSUS set");
+
+        let decoded = MucasFile::decode(&encoded).unwrap();
+        assert_eq!(decoded.program, prog);
+        assert_eq!(decoded.flags, 0x01);
+        assert_eq!(decoded.consensus.get(&vec![0x00u8]).unwrap(), &pattern);
+
+        // Execute through VM
+        let mut vm = VmState::new();
+        vm.exec(&decoded.program, &decoded.subs, &decoded.consensus).unwrap();
+        assert_eq!(vm.output, pattern);
+    }
+
+    #[test]
+    fn empty_consensus_produces_flag_zero() {
+        let f = MucasFile::new_with_consensus(vec![], no_subs(), Consensus::new());
+        let b = f.encode();
+        assert_eq!(b[5], 0x00, "empty consensus must not set FLAG_HAS_CONSENSUS");
+    }
+
     // --- Error cases ---
 
     #[test]
@@ -277,7 +375,6 @@ mod tests {
 
     #[test]
     fn multiple_subs_round_trip_correctly() {
-        // Two subs with non-sequential IDs to stress sort order.
         let sub3: Vec<u8> = ProgramBuilder::new().lit(b"THREE").build().0;
         let sub1: Vec<u8> = ProgramBuilder::new().lit(b"ONE").build().0;
         let subs: Subs = [(3u32, sub3), (1u32, sub1)].into_iter().collect();

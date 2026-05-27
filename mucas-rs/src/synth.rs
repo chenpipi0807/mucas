@@ -27,6 +27,10 @@ pub const MIN_MACRO_LEN:        usize = 8;    // minimum macro pattern length
 pub const MIN_MACRO_OCCUR:      usize = 2;    // minimum pattern occurrences (per-token)
 pub const MAX_MACRO_LEN:        usize = 64;   // maximum macro pattern length (rolling-hash range)
 pub const MIN_SCAN_ROWS:        usize = 10;   // minimum consecutive rows to attempt SCAN
+/// LIT tokens larger than this are skipped by both the rolling-hash macro search and the
+/// suffix-array macro search.  For large opaque tokens (beyond Zlib's 32 KB window and not
+/// captured by SCAN) the search is O(n²) and yields no gain — skip it to keep synthesis O(n).
+pub const MACRO_SEARCH_MAX_LIT: usize = 16 * 1024;
 /// Minimum LIT token size before the SA macro extractor is invoked (avoids SA overhead on small tokens).
 pub const SA_THRESHOLD:         usize = 256;
 /// SA-based search handles patterns longer than the rolling-hash ceiling.
@@ -399,6 +403,7 @@ pub fn find_best_macro(tokens: &[SynthToken], next_sub_id: u32) -> Option<(Vec<u
     for tok in tokens {
         if let SynthToken::Lit { data } = tok {
             let n = data.len();
+            if n > MACRO_SEARCH_MAX_LIT { continue; }
             let max_len = MAX_MACRO_LEN.min(n / MIN_MACRO_OCCUR);
             if max_len < MIN_MACRO_LEN { continue; }
 
@@ -1203,7 +1208,7 @@ impl PatternSynthesizer {
                 // SA-based search for patterns longer than MAX_MACRO_LEN (rolling-hash ceiling).
                 for tok in &prog.tokens {
                     if let SynthToken::Lit { data } = tok {
-                        if data.len() >= SA_THRESHOLD {
+                        if data.len() >= SA_THRESHOLD && data.len() <= MACRO_SEARCH_MAX_LIT {
                             if let Some((pat, _, gain)) = find_long_macro_by_sa(data, prog.next_sub_id) {
                                 if gain > best_gain {
                                     best_gain = gain;
@@ -1289,6 +1294,102 @@ impl PatternSynthesizer {
         self.rewrite_loop(&mut prog);
         prog
     }
+}
+
+// ---------------------------------------------------------------------------
+// REF synthesis pass
+// ---------------------------------------------------------------------------
+
+/// Replace LIT token spans that match consensus patterns with REF tokens.
+///
+/// Only patterns where `pat.len() > 2 + hash.len()` are applied (otherwise the
+/// REF token is not smaller than the literal bytes it replaces).
+/// After the pass, `prog.consensus` contains exactly the patterns that were used,
+/// so the MucasFile encoder can embed only what is needed.
+pub fn apply_ref_pass(prog: &mut SynthProgram, consensus: &Consensus) {
+    if consensus.is_empty() { return; }
+
+    // Build (pattern_bytes, hash_bytes) pairs; sort longest-pattern first so
+    // that when two patterns overlap we prefer the longer (more savings) match.
+    let mut patterns: Vec<(&[u8], &[u8])> = consensus
+        .iter()
+        .filter(|(h, p)| p.len() > 2 + h.len()) // REF must be smaller than LIT
+        .map(|(h, p)| (p.as_slice(), h.as_slice()))
+        .collect();
+    patterns.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+    if patterns.is_empty() { return; }
+
+    use std::collections::HashSet;
+    let mut used_hashes: HashSet<Vec<u8>> = HashSet::new();
+
+    let old_tokens = std::mem::take(&mut prog.tokens);
+    let mut new_tokens = Vec::with_capacity(old_tokens.len());
+
+    for token in old_tokens {
+        match token {
+            SynthToken::Lit { data } =>
+                apply_ref_to_lit(&data, &patterns, &mut new_tokens, &mut used_hashes),
+            other => new_tokens.push(other),
+        }
+    }
+
+    prog.tokens = new_tokens;
+
+    // Store only the patterns that were actually referenced.
+    prog.consensus = consensus
+        .iter()
+        .filter(|(h, _)| used_hashes.contains(h.as_slice()))
+        .map(|(h, p)| (h.clone(), p.clone()))
+        .collect();
+}
+
+/// Scan `data` left-to-right and split it into LIT / REF tokens.
+/// `patterns` must be sorted by pattern length descending.
+fn apply_ref_to_lit(
+    data:     &[u8],
+    patterns: &[(&[u8], &[u8])],  // (pattern, hash)
+    out:      &mut Vec<SynthToken>,
+    used:     &mut std::collections::HashSet<Vec<u8>>,
+) {
+    let mut pos = 0;
+    while pos < data.len() {
+        // Find leftmost (then longest) matching pattern starting at any position ≥ pos.
+        let mut best: Option<(usize, &[u8], &[u8])> = None; // (abs_pos, pattern, hash)
+        for (pattern, hash) in patterns.iter() {
+            if pattern.len() > data.len() - pos { continue; }
+            if let Some(rel) = find_bytes(&data[pos..], pattern) {
+                let abs = pos + rel;
+                let better = match &best {
+                    None => true,
+                    Some((bp, bpat, _)) =>
+                        abs < *bp || (abs == *bp && pattern.len() > bpat.len()),
+                };
+                if better { best = Some((abs, pattern, hash)); }
+            }
+        }
+
+        match best {
+            None => {
+                out.push(SynthToken::Lit { data: data[pos..].to_vec() });
+                break;
+            }
+            Some((match_pos, pattern, hash)) => {
+                if match_pos > pos {
+                    out.push(SynthToken::Lit { data: data[pos..match_pos].to_vec() });
+                }
+                used.insert(hash.to_vec());
+                out.push(SynthToken::Ref { hash: hash.to_vec() });
+                pos = match_pos + pattern.len();
+            }
+        }
+    }
+}
+
+#[inline]
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() { return None; }
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 // ---------------------------------------------------------------------------
@@ -1876,5 +1977,65 @@ mod tests {
         let data: Vec<u8> = row.repeat(30);
         assert!(detect_scan_json(&data, 0).is_none(),
             "all-fixed JSON should not trigger SCAN");
+    }
+
+    // --- apply_ref_pass ---
+
+    #[test]
+    fn apply_ref_pass_replaces_lit_with_ref() {
+        let pattern = b"STRUCTURED_LOG_PREFIX_DATA:".to_vec(); // 27 bytes
+        let mut consensus = Consensus::new();
+        consensus.insert(vec![0x00u8], pattern.clone());
+
+        // Build a SynthProgram with a LIT containing the pattern.
+        let data: Vec<u8> = [pattern.as_slice(), b" and more data"].concat();
+        let mut prog = SynthProgram::new(data.len());
+        prog.tokens.push(SynthToken::Lit { data: data.clone() });
+
+        apply_ref_pass(&mut prog, &consensus);
+
+        // Should have at least one REF token now.
+        assert!(
+            prog.tokens.iter().any(|t| matches!(t, SynthToken::Ref { .. })),
+            "apply_ref_pass must emit REF for a matching pattern"
+        );
+
+        // Round-trip must still work.
+        assert!(prog.verify_round_trip(&data), "round-trip failed after apply_ref_pass");
+    }
+
+    #[test]
+    fn apply_ref_pass_tracks_used_consensus() {
+        let p0 = b"PATTERN_ZERO_LONG_ENOUGH:".to_vec(); // 25 bytes
+        let p1 = b"PATTERN_ONE_ALSO_VALID!!!!".to_vec(); // 25 bytes
+        let mut consensus = Consensus::new();
+        consensus.insert(vec![0x00u8], p0.clone());
+        consensus.insert(vec![0x01u8], p1.clone());
+
+        // data only contains pattern zero
+        let data: Vec<u8> = [p0.as_slice(), b"_suffix"].concat();
+        let mut prog = SynthProgram::new(data.len());
+        prog.tokens.push(SynthToken::Lit { data: data.clone() });
+
+        apply_ref_pass(&mut prog, &consensus);
+
+        // prog.consensus must contain only pattern zero (the one actually used)
+        assert!(prog.consensus.contains_key(&vec![0x00u8]), "used pattern must be in prog.consensus");
+        assert!(!prog.consensus.contains_key(&vec![0x01u8]), "unused pattern must NOT be in prog.consensus");
+
+        assert!(prog.verify_round_trip(&data), "round-trip failed");
+    }
+
+    #[test]
+    fn apply_ref_pass_no_op_on_empty_consensus() {
+        let data = b"some arbitrary data here".to_vec();
+        let mut prog = SynthProgram::new(data.len());
+        prog.tokens.push(SynthToken::Lit { data: data.clone() });
+
+        apply_ref_pass(&mut prog, &Consensus::new());
+
+        // tokens unchanged
+        assert_eq!(prog.tokens.len(), 1);
+        assert!(matches!(&prog.tokens[0], SynthToken::Lit { data: d } if d == &data));
     }
 }

@@ -7,6 +7,7 @@ A deterministic bytecode language for structured compression, paired with an inf
 μCAS was designed collaboratively over a multi-day conversation between a human user, [Claude](https://claude.ai) (Anthropic), and [DeepSeek](https://chat.deepseek.com). The full theoretical dialogue is preserved here:
 
 - **[DeepSeek conversation archive (complete, v0.1 → v0.7) →](https://chat.deepseek.com/share/zys9ibg5775ot5r97m)**
+- **[DeepSeek conversation archive (v0.8 → v0.12.1, cross-file REF theory) →](https://chat.deepseek.com/share/mpud8uac7z0bd0mra6)**
 - [Earlier archive (v0.1 theory) →](https://chat.deepseek.com/share/exxssdoj9jkw1fgj0q)
 
 ---
@@ -26,7 +27,7 @@ No terminal needed after installation.
 
 ---
 
-## Rust implementation — v0.9.1 (active)
+## Rust implementation — v0.12.1 (active)
 
 **[`mucas-rs/`](mucas-rs/)** is the production Rust crate: a complete, self-contained
 compressor, archiver, and CLI tool that implements the μCAS VM and all synthesis passes.
@@ -35,10 +36,11 @@ compressor, archiver, and CLI tool that implements the μCAS VM and all synthesi
 
 ```sh
 # Download a pre-built binary from the Releases page, then:
-mucas pack    my_folder/  -o archive.mcar    # compress a whole directory
-mucas unpack  archive.mcar  -o restored/     # restore it
-mucas list    archive.mcar                   # see what's inside
-mucas check   archive.mcar                   # verify integrity
+mucas pack    my_folder/  -o archive.mcar         # standard pack
+mucas pack    my_folder/  -o archive.mcar --deep  # cross-file REF (see below)
+mucas unpack  archive.mcar  -o restored/          # restore
+mucas list    archive.mcar                        # see what's inside
+mucas check   archive.mcar                        # verify integrity
 ```
 
 ### Build from source
@@ -73,14 +75,39 @@ The speedup comes entirely from *not* wasting CPU: already-compressed formats (M
 ZIP, EXE, …) are detected by magic bytes in ≤ 12 bytes and stream-copied verbatim.
 7-zip attempts full LZMA2 compression on every file regardless of content.
 
-### v0.9 features
+### `--deep`: cross-file REF compression (v0.12+)
+
+For directories with many structurally identical files (logs, API responses, database exports):
+
+```sh
+mucas pack my_logs/ -o archive.mcar --deep
+```
+
+`--deep` runs a two-pass pipeline:
+1. **Scan pass** — synthesizes each file, extracts shared patterns from residual LIT tokens
+2. **Pack pass** — stores the pattern dictionary once in the archive header; each file's
+   shared regions become 3-byte REF tokens instead of full literal bytes
+
+**Cross-file REF benchmark** (40 homogeneous log files, 42 KB each, 1.7 MB total):
+
+| Mode | Archive size | vs standard |
+|------|-------------|------------|
+| Standard (`mucas pack`) | 135.9 KB | baseline |
+| **Deep (`mucas pack --deep`)** | **61.5 KB** | **−54.7%** |
+
+The `--deep` mode includes an automatic gain estimator: if cross-file REF is predicted to
+add overhead rather than savings, the REF step is skipped and the archive falls back to
+standard μCAS quality — no manual tuning required.
+
+### Features
 - **Streaming constant-memory archiver** — packs 800 GB directories without loading more than
   one file at a time; memory budget configurable with `--max-memory MiB`.
 - **Smart method selection** — μCAS vs Zlib vs Store chosen per-file by MDL comparison.
 - **Already-compressed detection** — JPEG, PNG, MP4, ZIP, 7z, RAR, gzip, PE (.exe), OGG, and
   more detected by magic bytes and stored verbatim (no wasted CPU).
+- **Cross-file REF** via `--deep` — archive-level consensus dictionary, linear gain scaling.
 - **Progress bars** via `indicatif`.
-- **Pre-built binaries** for Linux, macOS (Intel + Apple Silicon), and Windows via GitHub Actions.
+- **Pre-built binaries** for Linux, macOS (Apple Silicon), and Windows via GitHub Actions.
 
 ### Performance vs zlib (v0.7.0+)
 

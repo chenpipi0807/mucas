@@ -20,6 +20,7 @@ pub mod sched;
 pub mod format;
 pub mod pipeline;
 pub mod archive;
+pub mod consensus_builder;
 
 use std::collections::HashMap;
 

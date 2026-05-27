@@ -1,12 +1,21 @@
-//! MCAR — μCAS multi-file archive format (v0.9 streaming rewrite).
+//! MCAR — μCAS multi-file archive format.
 //!
 //! Binary layout (all multi-byte integers are little-endian):
 //!
 //!   Header (10 bytes):
 //!     [0]  magic:        [u8; 4] = b"MCAR"
 //!     [4]  version:      u8 = 0x01
-//!     [5]  flags:        u8 = 0x00 (reserved)
+//!     [5]  flags:        u8 — 0x00 = baseline; 0x01 = ARCHIVE_FLAG_HAS_CONSENSUS
 //!     [6]  entry_count:  u32
+//!
+//!   Consensus section (present when flags & 0x01 == 0x01):
+//!     section_len:       u32  — byte count of the section body (not including section_len)
+//!     count:             u32  — number of patterns
+//!     for each pattern (sorted by hash key):
+//!       hash_len:        u8
+//!       hash:            [u8; hash_len]
+//!       pat_len:         u32
+//!       pat:             [u8; pat_len]
 //!
 //!   Entry (repeated entry_count times):
 //!     path_len:          u16       — byte length of UTF-8 relative path
@@ -25,6 +34,13 @@
 //!   - ArchiveReader<R: Read>: streaming read; yields one entry at a time and
 //!     releases its memory before reading the next.
 //!   - compress_archive / decompress_archive: backwards-compat wrappers for tests.
+//!
+//! v0.12 change: consensus dictionary is stored ONCE in the archive header (not per-file).
+//!   REF tokens in individual MucasFile programs reference archive-level patterns.
+//!   MucasFile objects are created with `new()` (no embedded consensus); the global
+//!   consensus is injected at decompress time from the archive header.
+//!   Backward compat: v0.11 per-file consensus is still read correctly (file.consensus
+//!   is non-empty → used in preference over the empty global_consensus from an old reader).
 
 use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
@@ -33,7 +49,7 @@ use crate::format::{compress_zlib, decompress_zlib, MucasFile};
 use crate::pipeline::Pipeline;
 use crate::sched::{classify_with_data, is_already_compressed, ClassMetrics, DataClass};
 use crate::lz::LzEncoder;
-use crate::synth::shannon_entropy_byte;
+use crate::synth::{shannon_entropy_byte, apply_ref_pass};
 use crate::{VmState, Consensus};
 
 /// Files smaller than this use Zlib-only (skip μCAS synthesis).
@@ -44,10 +60,11 @@ const SMALL_FILE_THRESHOLD: usize = 64 * 1024;
 // Constants
 // ---------------------------------------------------------------------------
 
-pub const MAGIC:             [u8; 4] = [0x4D, 0x43, 0x41, 0x52]; // "MCAR"
-pub const VERSION:           u8      = 0x01;
-pub const DEFAULT_MAX_MEMORY: usize  = 256 * 1024 * 1024;         // 256 MiB
-const STREAM_BUF:            usize   = 64 * 1024;                  // 64 KiB copy buffer
+pub const MAGIC:                    [u8; 4] = [0x4D, 0x43, 0x41, 0x52]; // "MCAR"
+pub const VERSION:                  u8      = 0x01;
+pub const ARCHIVE_FLAG_HAS_CONSENSUS: u8    = 0x01;
+pub const DEFAULT_MAX_MEMORY:       usize   = 256 * 1024 * 1024;         // 256 MiB
+const STREAM_BUF:                   usize   = 64 * 1024;                  // 64 KiB copy buffer
 
 // ---------------------------------------------------------------------------
 // Method
@@ -138,12 +155,14 @@ impl WriteStats {
 // seek-back required.
 
 pub struct ArchiveWriter<W: Write> {
-    inner:          BufWriter<W>,
-    expected_count: u32,
-    actual_count:   u32,
-    max_memory:     usize,
-    pub stats:      WriteStats,
+    inner:           BufWriter<W>,
+    expected_count:  u32,
+    actual_count:    u32,
+    max_memory:      usize,
+    pub stats:       WriteStats,
     pub last_method: Option<Method>,
+    /// When Some, REF synthesis is applied to compressible entries.
+    consensus:       Option<Consensus>,
 }
 
 impl<W: Write> ArchiveWriter<W> {
@@ -154,10 +173,33 @@ impl<W: Write> ArchiveWriter<W> {
     }
 
     pub fn with_options(w: W, entry_count: u32, max_memory: usize) -> io::Result<Self> {
+        Self::with_consensus_options(w, entry_count, max_memory, None)
+    }
+
+    /// Like `with_options` but attaches a consensus dictionary for archive-level REF synthesis.
+    /// The consensus is serialized once into the archive header; individual MucasFile entries
+    /// do NOT embed their own consensus (REF tokens reference the archive-level patterns).
+    /// Pass `None` for standard (no REF) behaviour.
+    pub fn with_consensus_options(
+        w: W, entry_count: u32, max_memory: usize, consensus: Option<Consensus>,
+    ) -> io::Result<Self> {
         let mut inner = BufWriter::new(w);
+
+        // Determine whether we write a consensus section.
+        let has_consensus = matches!(&consensus, Some(c) if !c.is_empty());
+        let flags: u8 = if has_consensus { ARCHIVE_FLAG_HAS_CONSENSUS } else { 0x00 };
+
         inner.write_all(&MAGIC)?;
-        inner.write_all(&[VERSION, 0x00])?;
+        inner.write_all(&[VERSION, flags])?;
         inner.write_all(&entry_count.to_le_bytes())?;
+
+        // Write archive-level consensus section immediately after entry_count.
+        if has_consensus {
+            let section = serialize_consensus(consensus.as_ref().unwrap());
+            inner.write_all(&(section.len() as u32).to_le_bytes())?;
+            inner.write_all(&section)?;
+        }
+
         Ok(ArchiveWriter {
             inner,
             expected_count: entry_count,
@@ -165,13 +207,14 @@ impl<W: Write> ArchiveWriter<W> {
             max_memory,
             stats:          WriteStats::default(),
             last_method:    None,
+            consensus,
         })
     }
 
     /// Add a file from in-memory bytes.
     /// Used by `compress_archive()` wrapper and unit tests.
     pub fn add_file_bytes(&mut self, rel_path: &str, data: &[u8]) -> io::Result<()> {
-        let (method, comp) = compress_entry_data(data, self.max_memory);
+        let (method, comp) = compress_entry_data(data, self.max_memory, self.consensus.as_ref());
         self.write_entry(rel_path, method, data.len() as u64, &comp)
     }
 
@@ -271,10 +314,12 @@ impl<W: Write> ArchiveWriter<W> {
 // decompresses it.  Only one entry's data is in memory at a time.
 
 pub struct ArchiveReader<R: Read> {
-    inner:     R,
-    remaining: u32,
-    total:     u32,
-    index:     usize,
+    inner:            R,
+    remaining:        u32,
+    total:            u32,
+    index:            usize,
+    /// Archive-level consensus loaded from header (v0.12+). Empty for older archives.
+    global_consensus: Consensus,
 }
 
 pub struct DecodedEntry {
@@ -289,8 +334,22 @@ impl<R: Read> ArchiveReader<R> {
         r.read_exact(&mut hdr).map_err(|_| ArchiveError::TooShort)?;
         if hdr[0..4] != MAGIC  { return Err(ArchiveError::BadMagic); }
         if hdr[4] != VERSION   { return Err(ArchiveError::UnsupportedVersion(hdr[4])); }
+        let flags = hdr[5];
         let total = u32::from_le_bytes(hdr[6..10].try_into().unwrap());
-        Ok(ArchiveReader { inner: r, remaining: total, total, index: 0 })
+
+        // Parse archive-level consensus section if present.
+        let global_consensus = if flags & ARCHIVE_FLAG_HAS_CONSENSUS != 0 {
+            let mut sl = [0u8; 4];
+            r.read_exact(&mut sl).map_err(|_| ArchiveError::TooShort)?;
+            let section_len = u32::from_le_bytes(sl) as usize;
+            let mut buf = vec![0u8; section_len];
+            r.read_exact(&mut buf).map_err(|_| ArchiveError::TooShort)?;
+            parse_consensus_section(&buf).map_err(|_| ArchiveError::TooShort)?
+        } else {
+            Consensus::new()
+        };
+
+        Ok(ArchiveReader { inner: r, remaining: total, total, index: 0, global_consensus })
     }
 
     pub fn entry_count(&self) -> u32 { self.total }
@@ -320,8 +379,8 @@ impl<R: Read> ArchiveReader<R> {
         let mut comp = vec![0u8; compressed_size];
         self.inner.read_exact(&mut comp).map_err(|_| ArchiveError::TooShort)?;
 
-        // Decompress.
-        let data = decompress_entry(method, &comp, index)?;
+        // Decompress — pass archive-level consensus for REF lookup.
+        let data = decompress_entry(method, &comp, index, &self.global_consensus)?;
 
         self.remaining -= 1;
         self.index += 1;
@@ -353,7 +412,17 @@ pub fn list_archive<R: Read>(mut r: R) -> Result<Vec<EntryInfo>, ArchiveError> {
     r.read_exact(&mut hdr).map_err(|_| ArchiveError::TooShort)?;
     if hdr[0..4] != MAGIC  { return Err(ArchiveError::BadMagic); }
     if hdr[4] != VERSION   { return Err(ArchiveError::UnsupportedVersion(hdr[4])); }
+    let flags = hdr[5];
     let count = u32::from_le_bytes(hdr[6..10].try_into().unwrap()) as usize;
+
+    // Skip archive-level consensus section if present.
+    if flags & ARCHIVE_FLAG_HAS_CONSENSUS != 0 {
+        let mut sl = [0u8; 4];
+        r.read_exact(&mut sl).map_err(|_| ArchiveError::TooShort)?;
+        let section_len = u32::from_le_bytes(sl) as u64;
+        io::copy(&mut r.by_ref().take(section_len), &mut io::sink())
+            .map_err(|_| ArchiveError::TooShort)?;
+    }
 
     let mut entries = Vec::with_capacity(count);
     for i in 0..count {
@@ -412,9 +481,19 @@ pub fn archive_summary(data: &[u8]) -> Result<ArchiveSummary, ArchiveError> {
     if data[0..4] != MAGIC { return Err(ArchiveError::BadMagic); }
     if data[4] != VERSION  { return Err(ArchiveError::UnsupportedVersion(data[4])); }
 
+    let flags       = data[5];
     let entry_count = u32::from_le_bytes(data[6..10].try_into().unwrap()) as usize;
-    let mut pos  = 10usize;
-    let mut s    = ArchiveSummary {
+    let mut pos     = 10usize;
+
+    // Skip archive-level consensus section if present.
+    if flags & ARCHIVE_FLAG_HAS_CONSENSUS != 0 {
+        if pos + 4 > data.len() { return Err(ArchiveError::TooShort); }
+        let section_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+        pos += 4 + section_len;
+        if pos > data.len() { return Err(ArchiveError::TooShort); }
+    }
+
+    let mut s = ArchiveSummary {
         file_count: entry_count,
         total_original: 0, total_compressed: 0,
         store_count: 0, zlib_count: 0, mucas_count: 0,
@@ -462,7 +541,9 @@ impl ArchiveSummary {
 
 /// Compress `data` using the best available method, or Store if nothing wins.
 /// Respects `max_memory`: if `data.len() > max_memory`, force Store.
-fn compress_entry_data(data: &[u8], max_memory: usize) -> (Method, Vec<u8>) {
+/// When `consensus` is Some, applies REF substitutions after μCAS synthesis.
+/// REF patterns are stored in the archive-level consensus section, NOT embedded per-file.
+fn compress_entry_data(data: &[u8], max_memory: usize, consensus: Option<&Consensus>) -> (Method, Vec<u8>) {
     if is_already_compressed(data) || data.len() > max_memory {
         return (Method::Store, data.to_vec());
     }
@@ -474,7 +555,9 @@ fn compress_entry_data(data: &[u8], max_memory: usize) -> (Method, Vec<u8>) {
     }
 
     // Small files: synthesis overhead exceeds benefit — Zlib-only is competitive and much faster.
-    if data.len() < SMALL_FILE_THRESHOLD {
+    // Exception: when a consensus dictionary is available, try μCAS even on small files
+    // so REF substitutions can fire (consensus lookup is free; synthesis overhead is small).
+    if data.len() < SMALL_FILE_THRESHOLD && consensus.is_none() {
         let z = compress_zlib(data);
         return if z.len() < data.len() { (Method::Zlib, z) } else { (Method::Store, data.to_vec()) };
     }
@@ -492,8 +575,12 @@ fn compress_entry_data(data: &[u8], max_memory: usize) -> (Method, Vec<u8>) {
             if z.len() < data.len() { (Method::Zlib, z) } else { (Method::Store, data.to_vec()) }
         }
         _ => {
-            // Try μCAS and Zlib; take the smaller winner.
-            let (prog, _) = Pipeline::new().compress(data);
+            // Try μCAS (with optional REF pass) and Zlib; take the smaller winner.
+            let (mut prog, _) = Pipeline::new().compress(data);
+            if let Some(c) = consensus {
+                apply_ref_pass(&mut prog, c);
+            }
+            // v0.12: consensus lives in the archive header, not in each MucasFile.
             let (pb, subs) = prog.to_bytes();
             let mucas = MucasFile::new(pb, subs).encode();
             let zlib  = compress_zlib(data);
@@ -513,7 +600,9 @@ fn compress_entry_data(data: &[u8], max_memory: usize) -> (Method, Vec<u8>) {
 // Per-entry decompression
 // ---------------------------------------------------------------------------
 
-fn decompress_entry(method: Method, data: &[u8], index: usize) -> Result<Vec<u8>, ArchiveError> {
+fn decompress_entry(
+    method: Method, data: &[u8], index: usize, global_consensus: &Consensus,
+) -> Result<Vec<u8>, ArchiveError> {
     match method {
         Method::Store => Ok(data.to_vec()),
         Method::Zlib  => decompress_zlib(data)
@@ -521,12 +610,63 @@ fn decompress_entry(method: Method, data: &[u8], index: usize) -> Result<Vec<u8>
         Method::MuCAS => {
             let file = MucasFile::decode(data)
                 .map_err(|_| ArchiveError::MuCASDecompressFailed { index })?;
+            // v0.11 archives embed per-file consensus; v0.12+ use archive-level.
+            let consensus = if !file.consensus.is_empty() { &file.consensus } else { global_consensus };
             let mut vm = VmState::new();
-            vm.exec(&file.program, &file.subs, &Consensus::new())
+            vm.exec(&file.program, &file.subs, consensus)
                 .map_err(|_| ArchiveError::MuCASDecompressFailed { index })?;
             Ok(vm.output)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Consensus serialization helpers
+// ---------------------------------------------------------------------------
+
+/// Serialize a consensus map to the archive-level section body (count + entries).
+/// Sorted by hash key for deterministic output.
+fn serialize_consensus(consensus: &Consensus) -> Vec<u8> {
+    let mut sorted: Vec<(&Vec<u8>, &Vec<u8>)> = consensus.iter().collect();
+    sorted.sort_by_key(|(h, _)| *h);
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+    for (hash, pattern) in &sorted {
+        buf.push(hash.len() as u8);
+        buf.extend_from_slice(hash);
+        buf.extend_from_slice(&(pattern.len() as u32).to_le_bytes());
+        buf.extend_from_slice(pattern);
+    }
+    buf
+}
+
+/// Parse a consensus section body (count + entries) into a Consensus map.
+fn parse_consensus_section(data: &[u8]) -> Result<Consensus, ()> {
+    let mut pos = 0;
+    if pos + 4 > data.len() { return Err(()); }
+    let count = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+    pos += 4;
+
+    let mut consensus = Consensus::new();
+    for _ in 0..count {
+        if pos >= data.len() { return Err(()); }
+        let hash_len = data[pos] as usize;
+        pos += 1;
+        if pos + hash_len > data.len() { return Err(()); }
+        let hash = data[pos..pos + hash_len].to_vec();
+        pos += hash_len;
+
+        if pos + 4 > data.len() { return Err(()); }
+        let pat_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+        pos += 4;
+        if pos + pat_len > data.len() { return Err(()); }
+        let pattern = data[pos..pos + pat_len].to_vec();
+        pos += pat_len;
+
+        consensus.insert(hash, pattern);
+    }
+    Ok(consensus)
 }
 
 // ---------------------------------------------------------------------------
@@ -713,5 +853,82 @@ mod tests {
         assert_eq!(w.last_method, Some(Method::Store));
         assert_eq!(w.stats.store_count, 1);
         w.finish().unwrap();
+    }
+
+    // --- Archive-level consensus (v0.12) ---
+
+    #[test]
+    fn archive_consensus_roundtrip() {
+        // Build a 3-entry archive with a shared pattern across all entries.
+        let shared = b"GLOBAL_CONSENSUS_PATTERN_ABCDE!"; // 31 bytes, high entropy
+        assert_eq!(shared.len(), 31);
+
+        // Each entry: shared pattern repeated 5x + unique suffix
+        let make_entry = |suffix: &[u8]| -> Vec<u8> {
+            let mut v = Vec::new();
+            for _ in 0..5 { v.extend_from_slice(shared); }
+            v.extend_from_slice(suffix);
+            v
+        };
+        let d0 = make_entry(b"entry_zero_unique_data");
+        let d1 = make_entry(b"entry_one_unique_data_here");
+        let d2 = make_entry(b"entry_two_unique_data_here_now");
+
+        // Build consensus from the shared pattern.
+        let mut consensus = Consensus::new();
+        consensus.insert(vec![0x00], shared.to_vec());
+
+        let entries: Vec<(String, Vec<u8>)> = vec![
+            ("e0.bin".to_string(), d0.clone()),
+            ("e1.bin".to_string(), d1.clone()),
+            ("e2.bin".to_string(), d2.clone()),
+        ];
+
+        // Write with archive-level consensus.
+        let cursor = Cursor::new(Vec::<u8>::new());
+        let mut w  = ArchiveWriter::with_consensus_options(
+            cursor, 3, DEFAULT_MAX_MEMORY, Some(consensus),
+        ).unwrap();
+        for (path, data) in &entries {
+            w.add_file_bytes(path, data).unwrap();
+        }
+        let enc = w.finish().unwrap().into_inner();
+
+        // Check archive flags byte.
+        assert_eq!(enc[5], ARCHIVE_FLAG_HAS_CONSENSUS, "flags must indicate consensus section");
+
+        // Round-trip: decompress and verify.
+        let dec = decompress_archive(&enc).unwrap();
+        assert_eq!(dec[0].1, d0, "entry 0 mismatch");
+        assert_eq!(dec[1].1, d1, "entry 1 mismatch");
+        assert_eq!(dec[2].1, d2, "entry 2 mismatch");
+
+        // list_archive and archive_summary must also parse correctly.
+        let listing = list_archive(Cursor::new(enc.as_slice())).unwrap();
+        assert_eq!(listing.len(), 3);
+        let summary = archive_summary(&enc).unwrap();
+        assert_eq!(summary.file_count, 3);
+    }
+
+    #[test]
+    fn consensus_section_serialise_parse_roundtrip() {
+        let mut c = Consensus::new();
+        c.insert(vec![0x00], b"PATTERN_ALPHA_XXXX".to_vec());
+        c.insert(vec![0x01], b"PATTERN_BETA_YYYY!".to_vec());
+        let serialized = serialize_consensus(&c);
+        let parsed = parse_consensus_section(&serialized).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed.get(&vec![0x00u8]).unwrap(), b"PATTERN_ALPHA_XXXX");
+        assert_eq!(parsed.get(&vec![0x01u8]).unwrap(), b"PATTERN_BETA_YYYY!");
+    }
+
+    #[test]
+    fn archive_without_consensus_unaffected() {
+        // Non-consensus archives must still work exactly as before (flags=0x00).
+        let entries = vec![("data.csv".to_string(), csv_data())];
+        let enc = compress_archive(&entries);
+        assert_eq!(enc[5], 0x00, "no-consensus archive must have flags=0x00");
+        let dec = decompress_archive(&enc).unwrap();
+        assert_eq!(dec[0].1, csv_data());
     }
 }

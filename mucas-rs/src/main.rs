@@ -14,9 +14,11 @@ use mucas::{VmState, Consensus};
 use mucas::pipeline::Pipeline;
 use mucas::format::{MucasFile, compress_zlib};
 use mucas::archive::{
-    ArchiveWriter, ArchiveReader, list_archive,
+    ArchiveWriter, ArchiveReader, list_archive, peek_is_already_compressed,
     DEFAULT_MAX_MEMORY, Method,
 };
+use mucas::consensus_builder::{ConsensusBuilder, MIN_FEED_SIZE, GAIN_THRESHOLD, estimate_ref_net_gain};
+use mucas::synth::SynthToken;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -40,13 +42,17 @@ fn main() {
 }
 
 fn usage() {
-    eprintln!("mucas v0.9  —  μCAS adaptive compressor & archiver");
+    eprintln!("mucas v0.11  —  μCAS adaptive compressor & archiver");
     eprintln!();
     eprintln!("Archive commands:");
-    eprintln!("  mucas pack    <source_dir>   [-o out.mcar] [--max-memory MiB]");
+    eprintln!("  mucas pack    <source_dir>   [-o out.mcar] [--max-memory MiB] [--deep]");
     eprintln!("  mucas unpack  <input.mcar>   [-o output_dir]");
     eprintln!("  mucas list    <input.mcar>");
     eprintln!("  mucas check   <input.mcar>");
+    eprintln!();
+    eprintln!("  --deep: two-pass mode — scan compressible files first to build a");
+    eprintln!("          cross-file REF dictionary, then pack with REF synthesis.");
+    eprintln!("          Best for homogeneous archives (logs, CSV, NDJSON).");
     eprintln!();
     eprintln!("Single-file commands:");
     eprintln!("  mucas compress   <input>       <output.mucas>");
@@ -60,14 +66,32 @@ fn usage() {
 
 fn pack_cmd(args: &[String]) -> Result<(), String> {
     // Accept both new ('pack') and legacy ('archive') command name.
-    let source_dir = args.get(2).ok_or("missing source directory")?;
+    // Flags (starting with '-') may appear in any position; collect positional args separately.
+    let positional: Vec<&String> = {
+        let mut pos = Vec::new();
+        let mut i = 2;
+        while i < args.len() {
+            if args[i] == "-o" || args[i] == "--max-memory" {
+                i += 2; // skip flag + value
+            } else if args[i].starts_with('-') {
+                i += 1;
+            } else {
+                pos.push(&args[i]);
+                i += 1;
+            }
+        }
+        pos
+    };
+    let source_dir = positional.first().ok_or("missing source directory")?;
 
-    // Parse flags: -o <output>, --max-memory <MiB>
-    let output     = flag_value(args, "-o")
+    // Parse flags: -o <output>, --max-memory <MiB>, --deep
+    let output = flag_value(args, "-o")
+        .or_else(|| positional.get(1).map(|s| s.to_string()))
         .unwrap_or_else(|| format!("{}.mcar", source_dir.trim_end_matches(['/', '\\'])));
     let max_memory = parse_max_memory(args).unwrap_or(DEFAULT_MAX_MEMORY);
+    let deep       = args.iter().any(|a| a == "--deep");
 
-    // --- Pass 1: collect paths (no file content) ---
+    // --- Pass 1: collect file paths (no content read yet) ---
     let mut paths: Vec<(String, std::path::PathBuf)> = Vec::new();
     collect_paths(
         std::path::Path::new(source_dir),
@@ -82,7 +106,70 @@ fn pack_cmd(args: &[String]) -> Result<(), String> {
 
     let total = paths.len() as u32;
 
-    // --- Progress bar ---
+    // --- Optional --deep: consensus-building scan pass ---
+    let consensus: Option<Consensus> = if deep {
+        let pb_scan = ProgressBar::new(total as u64);
+        pb_scan.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.yellow} [{bar:40.yellow/white}] {pos}/{len}  {msg}"
+            ).unwrap().progress_chars("█▉▊▋▌▍▎▏ "),
+        );
+        pb_scan.set_message("scanning for cross-file patterns (--deep)…");
+
+        let mut builder = ConsensusBuilder::new();
+        for (_rel_path, abs_path) in &paths {
+            let meta = std::fs::metadata(abs_path).map_err(|e| e.to_string())?;
+            let size = meta.len();
+            // Only read compressible files that fit in max_memory and exceed the
+            // Zlib window threshold — files ≤ MIN_FEED_SIZE are fully covered by
+            // Zlib's 32 KB window and don't benefit from cross-file REF.
+            let already_compressed = peek_is_already_compressed(abs_path).unwrap_or(true);
+            if !already_compressed && size > MIN_FEED_SIZE as u64 && size <= max_memory as u64 {
+                if let Ok(data) = std::fs::read(abs_path) {
+                    // Feed only the top-level LIT token bytes from the synthesized program.
+                    // apply_ref_pass only matches within top-level LIT tokens, so feeding
+                    // raw bytes would pollute the consensus with patterns inside SCAN/CPY
+                    // regions that can never be replaced by REF instructions.
+                    let (prog, _) = Pipeline::new().compress(&data);
+                    let mut lit_bytes: Vec<u8> = Vec::new();
+                    for tok in &prog.tokens {
+                        if let SynthToken::Lit { data: lit } = tok {
+                            lit_bytes.extend_from_slice(lit);
+                        }
+                    }
+                    if !lit_bytes.is_empty() {
+                        builder.feed(&lit_bytes);
+                    }
+                }
+            }
+            pb_scan.inc(1);
+        }
+        pb_scan.finish_and_clear();
+
+        let files_scanned = builder.files_seen();
+        let c = builder.build();
+        let n = c.len();
+        if n > 0 {
+            let net = estimate_ref_net_gain(&c, files_scanned);
+            if net >= GAIN_THRESHOLD {
+                eprintln!("  Deep scan: {n} consensus patterns (est. +{net} B net REF gain)");
+                Some(c)
+            } else {
+                eprintln!(
+                    "  Deep scan: {n} patterns found, est. net gain {net} B \
+                     < {GAIN_THRESHOLD} B threshold; REF skipped"
+                );
+                Some(Consensus::new()) // still run μCAS synthesis; just no REF
+            }
+        } else {
+            eprintln!("  Deep scan: no patterns met coverage/entropy threshold");
+            Some(Consensus::new())
+        }
+    } else {
+        None
+    };
+
+    // --- Progress bar for pack pass ---
     let pb = ProgressBar::new(total as u64);
     pb.set_style(
         ProgressStyle::with_template(
@@ -91,9 +178,9 @@ fn pack_cmd(args: &[String]) -> Result<(), String> {
     );
     pb.set_message(format!("packing {} → {}", source_dir, output));
 
-    // --- Pass 2: stream-compress each file ---
+    // --- Pack pass: stream-compress each file ---
     let out_file = std::fs::File::create(&output).map_err(|e| e.to_string())?;
-    let mut writer = ArchiveWriter::with_options(out_file, total, max_memory)
+    let mut writer = ArchiveWriter::with_consensus_options(out_file, total, max_memory, consensus)
         .map_err(|e| e.to_string())?;
 
     for (_i, (rel_path, abs_path)) in paths.iter().enumerate() {

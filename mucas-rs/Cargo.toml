@@ -1,6 +1,6 @@
 [package]
 name = "mucas-rs"
-version = "0.9.1"
+version = "0.12.1"
 edition = "2021"
 description = "μCAS — structure-aware adaptive compressor for structured text data"
 keywords  = ["compression", "csv", "json", "ndjson", "structured-data"]

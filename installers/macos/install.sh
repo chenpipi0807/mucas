@@ -2,25 +2,18 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ARCH="$(uname -m)"
 
 echo ""
-echo "  μCAS Installer"
-echo "  =============="
+echo "  μCAS Installer (Apple Silicon)"
+echo "  ==============================="
 echo ""
 
-# Pick correct binary for this architecture
-if [ "$ARCH" = "arm64" ] && [ -f "$SCRIPT_DIR/mucas-arm64" ]; then
-    SRC="$SCRIPT_DIR/mucas-arm64"
-    echo "  Detected: Apple Silicon (arm64)"
-elif [ -f "$SCRIPT_DIR/mucas" ]; then
-    SRC="$SCRIPT_DIR/mucas"
-    echo "  Detected: Intel (x86_64)"
-else
-    echo "  ERROR: No mucas binary found next to install.sh"
+if [ ! -f "$SCRIPT_DIR/mucas" ]; then
+    echo "  ERROR: mucas binary not found next to install.sh"
     echo "  Please extract the full zip archive before running this installer."
     exit 1
 fi
+SRC="$SCRIPT_DIR/mucas"
 
 # Install binary
 if [ -w /usr/local/bin ]; then
